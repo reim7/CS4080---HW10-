@@ -1,0 +1,279 @@
+## 1. Add the New Keyword to the Scanner
+
+First, add `TOKEN_CONST` to the TokenType enumeration
+in scanner.h.
+
+```c
+typedef enum {
+  // Existing token types...
+  TOKEN_CONST,
+  // Remaining token types...
+} TokenType;
+```
+
+Next, update identifierType() in scanner.c so
+that the scanner recognizes `const` as a keyword
+instead of an ordinary identifier.
+
+In the existing case for identifiers beginning
+with 'c', distinguish `const` from `class`:
+
+```c
+case 'c':
+  if (scanner.current - scanner.start > 1) {
+    switch (scanner.start[1]) {
+      case 'l':
+        return checkKeyword(2, 3, "ass", TOKEN_CLASS);
+      case 'o':
+        return checkKeyword(2, 3, "nst", TOKEN_CONST);
+    }
+  }
+  break;
+```
+
+The scanner can now return TOKEN_CONST when it
+encounters the word `const`.
+
+## 2. Track Whether a Local Variable Is Constant
+
+In Chapter 22, the compiler uses the Local structure
+to store information about each local variable.
+
+I would add a boolean field named isConst:
+
+```c
+typedef struct {
+  Token name;
+  int depth;
+  bool isConst;
+} Local;
+```
+
+The new field indicates whether the variable
+was declared using `const`.
+
+Ordinary variables have isConst set to false,
+while constant variables have it set to true.
+
+## 3. Update addLocal()
+
+Change addLocal() to accept an additional argument
+indicating whether the new variable is constant.
+
+```c
+static void addLocal(Token name, bool isConst) {
+  if (current->localCount == UINT8_COUNT) {
+    error("Too many local variables in function.");
+    return;
+  }
+
+  Local* local = &current->locals[current->localCount++];
+
+  local->name = name;
+  local->depth = -1;
+  local->isConst = isConst;
+}
+```
+
+The depth is initially -1 because Chapter 22 uses
+that value to indicate that a local variable
+has not finished being initialized.
+
+The compiler later marks the variable as initialized.
+
+## 4. Update Variable Declaration Handling
+
+The compiler also needs to pass the new flag through
+the variable declaration functions.
+
+Update declareVariable() to accept isConst and
+pass it to addLocal().
+
+```c
+static void declareVariable(bool isConst) {
+  if (current->scopeDepth == 0) return;
+
+  Token* name = &parser.previous;
+
+  for (int i = current->localCount - 1; i >= 0; i--) {
+    Local* local = &current->locals[i];
+
+    if (local->depth != -1 &&
+        local->depth < current->scopeDepth) {
+      break;
+    }
+
+    if (identifiersEqual(name, &local->name)) {
+      error("Already a variable with this name in this scope.");
+    }
+  }
+
+  addLocal(*name, isConst);
+}
+```
+
+Then update parseVariable() to receive the same flag:
+
+```c
+static uint8_t parseVariable(const char* errorMessage,
+                             bool isConst) {
+  consume(TOKEN_IDENTIFIER, errorMessage);
+
+  declareVariable(isConst);
+
+  if (current->scopeDepth > 0) return 0;
+
+  return identifierConstant(&parser.previous);
+}
+```
+
+The existing varDeclaration() must now call:
+
+```c
+uint8_t global =
+    parseVariable("Expect variable name.", false);
+```
+
+This preserves the normal behavior of `var`.
+
+## 5. Add constDeclaration()
+
+Create a new declaration function for constant
+variables.
+
+```c
+static void constDeclaration() {
+  uint8_t global =
+      parseVariable("Expect constant name.", true);
+
+  consume(TOKEN_EQUAL,
+          "Constants must have an initializer.");
+
+  expression();
+
+  consume(TOKEN_SEMICOLON,
+          "Expect ';' after constant declaration.");
+
+  defineVariable(global);
+}
+```
+
+Requiring an initializer ensures that the constant
+has a value when its declaration is completed.
+
+The existing defineVariable() function can be
+used to finish initializing local variables.
+
+## 6. Recognize const Declarations
+
+Update declaration() in compiler.c.
+
+```c
+static void declaration() {
+  if (match(TOKEN_CONST)) {
+    constDeclaration();
+  } else if (match(TOKEN_VAR)) {
+    varDeclaration();
+  } else {
+    statement();
+  }
+
+  if (parser.panicMode) synchronize();
+}
+```
+
+Also add TOKEN_CONST to the parser's synchronization
+logic so error recovery recognizes it as the
+beginning of a declaration.
+
+The parse-rule table should include:
+
+```c
+[TOKEN_CONST] = {NULL, NULL, PREC_NONE},
+```
+
+## 7. Prevent Reassignment to Local Constants
+
+The most important change is inside namedVariable().
+
+Chapter 22 already uses resolveLocal() to find
+a local variable's stack slot.
+
+After finding a local, we can check whether that
+variable is constant.
+
+```c
+static void namedVariable(Token name, bool canAssign) {
+  uint8_t getOp, setOp;
+  int arg = resolveLocal(current, &name);
+  bool isConst = false;
+
+  if (arg != -1) {
+    getOp = OP_GET_LOCAL;
+    setOp = OP_SET_LOCAL;
+
+    isConst = current->locals[arg].isConst;
+  } else {
+    arg = identifierConstant(&name);
+    getOp = OP_GET_GLOBAL;
+    setOp = OP_SET_GLOBAL;
+  }
+
+  if (canAssign && match(TOKEN_EQUAL)) {
+    if (isConst) {
+      error("Can't assign to a constant variable.");
+    }
+
+    expression();
+    emitBytes(setOp, (uint8_t)arg);
+  } else {
+    emitBytes(getOp, (uint8_t)arg);
+  }
+}
+```
+
+If the assignment targets a local variable declared
+with `const`, the compiler reports an error.
+
+The compiler may still emit bytecode while recovering
+from the error, but the compilation fails and the
+invalid program is not executed.
+
+## 8. Supporting Global Constants
+
+The local-variable change above does not fully
+implement constant globals.
+
+Chapter 21 explains that global variables in clox
+are late-bound, so the compiler does not normally
+keep a complete list of global declarations.
+
+To support global `const` variables, I would add
+a compiler-side table that records which global
+names are constant.
+
+Conceptually:
+
+```text
+globalConstants:
+    "pi" -> true
+    "limit" -> true
+```
+
+When the compiler encounters a global `const`
+declaration, it would record the name.
+
+When compiling an assignment to a global variable,
+it would check this table and report an error if
+the name represents a constant.
+
+The table would need to preserve information across
+REPL inputs and correctly handle global redeclarations.
+
+A complete implementation must also account for
+functions that reference constants declared later
+in the script. A declaration prepass could collect
+those names before normal compilation.
+
+This would make the restriction consistent for
+both local and global variables.
