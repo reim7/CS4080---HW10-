@@ -1,0 +1,351 @@
+## 1. Increase the Local Variable Array
+
+The original Compiler structure contains:
+
+```c
+Local locals[UINT8_COUNT];
+```
+
+To allow more local variables, I would define
+a larger limit.
+
+In compiler.c:
+
+```c
+#define MAX_LOCALS 1024
+```
+
+Then update the Compiler structure:
+
+```c
+typedef struct {
+  Local locals[MAX_LOCALS];
+  int localCount;
+  int scopeDepth;
+} Compiler;
+```
+
+The compiler can now track up to 1,024 local
+variables instead of only 256.
+
+## 2. Update the Local Variable Limit Check
+
+The addLocal() function checks whether the
+compiler has room for another local variable.
+
+Originally, this check uses UINT8_COUNT.
+
+I would update it to use MAX_LOCALS.
+
+```c
+static void addLocal(Token name) {
+  if (current->localCount == MAX_LOCALS) {
+    error("Too many local variables in function.");
+    return;
+  }
+
+  Local* local =
+      &current->locals[current->localCount++];
+
+  local->name = name;
+  local->depth = -1;
+}
+```
+
+This prevents the compiler from writing past the
+end of the larger array.
+
+The depth is initially set to -1 because
+Chapter 22 uses that value to mark a local
+variable that has not finished initializing.
+
+## 3. Use Two-Byte Local Variable Operands
+
+Increasing the local array alone is not enough.
+
+The bytecode still needs to represent stack slots
+with indexes greater than 255.
+
+The original implementation emits one-byte
+operands for OP_GET_LOCAL and OP_SET_LOCAL.
+
+I would update these instructions to use two
+bytes for their slot indexes.
+
+A two-byte unsigned operand can represent
+values from 0 to 65,535, which is more than
+enough for the new 1,024-local limit.
+
+First, add a helper function in compiler.c:
+
+```c
+static void emitShort(uint16_t value) {
+  emitByte((value >> 8) & 0xff);
+  emitByte(value & 0xff);
+}
+```
+
+This stores a 16-bit number as two bytes,
+with the most significant byte first.
+
+The OP_GET_LOCAL and OP_SET_LOCAL instructions
+would retain their original opcode names,
+but now each would have a two-byte operand.
+
+## 4. Update Local Variable Code Generation
+
+The namedVariable() function determines whether
+a variable should be accessed as a local
+or a global variable.
+
+The global instructions can continue using
+their original one-byte operands.
+
+For local variables, I would emit the opcode
+followed by the two-byte stack slot index.
+
+The relevant part of namedVariable() becomes:
+
+```c
+static void namedVariable(Token name, bool canAssign) {
+  uint8_t getOp, setOp;
+
+  int arg = resolveLocal(current, &name);
+  bool isLocal = arg != -1;
+
+  if (isLocal) {
+    getOp = OP_GET_LOCAL;
+    setOp = OP_SET_LOCAL;
+  } else {
+    arg = identifierConstant(&name);
+    getOp = OP_GET_GLOBAL;
+    setOp = OP_SET_GLOBAL;
+  }
+
+  if (canAssign && match(TOKEN_EQUAL)) {
+    expression();
+
+    emitByte(setOp);
+
+    if (isLocal) {
+      emitShort((uint16_t)arg);
+    } else {
+      emitByte((uint8_t)arg);
+    }
+  } else {
+    emitByte(getOp);
+
+    if (isLocal) {
+      emitShort((uint16_t)arg);
+    } else {
+      emitByte((uint8_t)arg);
+    }
+  }
+}
+```
+
+This allows the compiler to generate bytecode
+for local variables with slot indexes above 255.
+
+Global variable instructions are unchanged
+because this challenge only concerns locals.
+
+## 5. Update the Virtual Machine
+
+The VM must also be able to read two-byte
+operands for local variable instructions.
+
+Inside run() in vm.c, add the following macro
+alongside the existing byte-reading macros:
+
+```c
+#define READ_SHORT() \
+  (vm.ip += 2, \
+   (uint16_t)((vm.ip[-2] << 8) | vm.ip[-1]))
+```
+
+Then update OP_GET_LOCAL:
+
+```c
+case OP_GET_LOCAL: {
+  uint16_t slot = READ_SHORT();
+  push(vm.stack[slot]);
+  break;
+}
+```
+
+Update OP_SET_LOCAL:
+
+```c
+case OP_SET_LOCAL: {
+  uint16_t slot = READ_SHORT();
+  vm.stack[slot] = peek(0);
+  break;
+}
+```
+
+Previously, these instructions read only
+one byte using READ_BYTE().
+
+Now they read a 16-bit slot index.
+
+This allows the VM to access local variables
+stored beyond the original 256-slot limit.
+
+The READ_SHORT macro should also be undefined
+at the end of run(), along with the other
+instruction-reading macros.
+
+## 6. Increase the VM Stack Capacity
+
+The original clox VM also has a fixed-size
+stack that can hold 256 values.
+
+Even if the compiler supports more locals,
+the VM would run out of stack space unless
+its capacity is increased.
+
+In vm.h, change the stack limit to:
+
+```c
+#define STACK_MAX 4096
+```
+
+The VM's existing stack declaration can
+continue using:
+
+```c
+Value stack[STACK_MAX];
+```
+
+This provides space for the 1,024 local
+variables as well as additional temporary
+values used when evaluating expressions.
+
+For a production implementation, I would
+also add stack overflow checks or use
+dynamically growing stack storage.
+
+## 7. Update the Disassembler
+
+Since OP_GET_LOCAL and OP_SET_LOCAL now
+have two-byte operands, the disassembler
+must read them correctly.
+
+In debug.c, add a helper function:
+
+```c
+static int shortInstruction(const char* name,
+                            Chunk* chunk, int offset) {
+  uint16_t slot =
+      (uint16_t)(chunk->code[offset + 1] << 8);
+
+  slot |= chunk->code[offset + 2];
+
+  printf("%-16s %4u\n", name, (unsigned)slot);
+
+  return offset + 3;
+}
+```
+
+Then update the corresponding cases in
+disassembleInstruction():
+
+```c
+case OP_GET_LOCAL:
+  return shortInstruction("OP_GET_LOCAL",
+                          chunk, offset);
+
+case OP_SET_LOCAL:
+  return shortInstruction("OP_SET_LOCAL",
+                          chunk, offset);
+```
+
+The disassembler now advances by three bytes
+for each local variable instruction:
+one opcode byte and two operand bytes.
+
+## 8. Example Test
+
+To verify that the new design can handle
+more than 256 local variables, I would
+test a block containing 300 declarations.
+
+For example, the generated Lox program
+would look like:
+
+```lox
+{
+  var a0 = 0;
+  var a1 = 1;
+  var a2 = 2;
+
+  // Continue declaring variables...
+
+  var a298 = 298;
+  var a299 = 299;
+
+  print a299;
+}
+```
+
+Expected output:
+
+```text
+299
+```
+
+To generate the full test automatically,
+I could use the following Python script:
+
+```python
+with open("test_many_locals.lox", "w") as file:
+    file.write("{\n")
+
+    for i in range(300):
+        file.write(f"  var a{i} = {i};\n")
+
+    file.write("  print a299;\n")
+    file.write("}\n")
+```
+
+This test is useful because it creates
+more local variables than the original
+one-byte limit allows.
+
+The test should also confirm that the
+last variable can be accessed correctly.
+
+Additional tests should verify assignment
+to a high-numbered local slot, nested
+scopes, and ordinary variable shadowing.
+
+These are proposed tests, not recorded
+test executions.
+
+## 9. Performance and Memory Considerations
+
+Using two-byte operands allows the VM
+to access a much larger number of local
+variables.
+
+However, it also increases the size
+of bytecode instructions for local
+variable access and assignment.
+
+Originally, OP_GET_LOCAL and OP_SET_LOCAL
+used two bytes total: one for the opcode
+and one for the operand.
+
+With this design, each uses three bytes.
+
+This slightly increases memory consumption
+and the amount of bytecode the VM reads.
+
+Increasing the compiler's local variable
+array and the VM stack also requires
+additional memory.
+
+However, local variable access remains
+efficient because the VM still uses
+direct indexing into the stack.
