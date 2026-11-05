@@ -1,0 +1,124 @@
+## 1. Keep the Existing Local Array
+
+I would keep the existing local array because its indexes
+correspond directly to the VM's stack slots.
+
+The hash table would only be used to make name resolution
+faster during compilation.
+
+Conceptually, the compiler would contain:
+
+```c
+typedef struct {
+  Local locals[UINT8_COUNT];
+  int localCount;
+  int scopeDepth;
+
+  // Additional lookup structure:
+  LocalNameTable localNames;
+} Compiler;
+```
+
+Here, LocalNameTable represents a new hash-based lookup
+structure designed for local variable names.
+
+## 2. Resolve Variables Using a Hash Table
+
+Instead of scanning all active locals, the compiler
+would look up the identifier in the hash table.
+
+Conceptual pseudocode:
+
+```text
+resolveLocal(name):
+    if name exists in localNames:
+        slot = localNames[name].top
+        if locals[slot].depth == -1:
+            report initializer error
+        return slot
+
+    return -1
+```
+
+An average hash table lookup takes approximately O(1)
+time, making repeated variable resolution more efficient.
+
+## 3. Preserve Variable Shadowing
+
+The implementation must still support nested scopes.
+
+For example:
+
+```lox
+{
+  var a = "outer";
+  {
+    var a = "inner";
+    print a;
+  }
+  print a;
+}
+```
+
+The first print should use the inner variable, while the
+second should use the outer variable.
+
+To support this, each identifier can have a stack of
+active local slot indexes.
+
+When a new variable is declared, its slot is pushed onto
+the list associated with that name.
+
+When the scope ends, the corresponding slot is removed.
+
+This restores the previously visible declaration.
+
+## 4. Maintain Scope and Initialization Rules
+
+The optimization must also preserve the rules described
+in Chapter 22.
+
+- Redeclaring a variable in the same local scope is an error.
+- A variable in an inner scope may shadow an outer variable.
+- Reading a local variable in its own initializer is an error.
+- Local variables are discarded when their scope ends.
+
+The compiler must continue to use the depth value -1
+to identify variables that are declared but not yet
+initialized.
+
+The hash table should be updated whenever locals enter
+or leave scope.
+
+## 5. Performance Comparison
+
+Original approach:
+- Linear search through active locals
+- O(n) worst-case resolution
+- Simple implementation with little additional memory
+
+Optimized approach:
+- Hash table lookup by identifier
+- Approximately O(1) average-case resolution
+- Additional memory and bookkeeping required
+- More complicated scope and shadowing management
+
+## Is the Complexity Worth It?
+
+I think this optimization could be useful in a language
+that supports large numbers of local variables or requires
+very fast compilation.
+
+However, clox currently limits the number of locals in
+scope to 256, so the linear search is already bounded.
+
+Adding a hash table would make the compiler more complex
+and require additional memory for tracking names and scopes.
+
+Because the lookup happens during compilation rather
+than runtime, the improvement would not directly make
+the generated program execute faster.
+
+For a small interpreter like clox, I would probably keep
+the original array-based approach unless benchmarking
+showed that local variable resolution was a bottleneck.
